@@ -25,6 +25,16 @@ X 搜索 MCP 服务器（stdio，零依赖，只用 Python 自带库）。Grok �
 命令行没有 60 秒的限制，一条命令等到搜完为止（实测 72 小时范围约 6 分钟）。
 Claude 的 x-search skill 用的就是这个入口。不带参数启动时才是 MCP 服务器。
 
+## HTTP 模式（接成 Claude 连接器，任意对话可用）
+
+在一台有公网入口的服务器上常驻运行，然后在 Claude 的连接器设置里添加它的网址。
+部署步骤见 `deploy/README.md`。要点：
+
+- 启动：`python3 x_search_mcp.py serve --port 8765`，默认只监听本机 `127.0.0.1`，由前面的 HTTPS 入口转发进来。
+- 访问口令 `X_HTTP_TOKEN` 放在服务器的 `.env` 里。服务入口是 `POST /mcp/<口令>`，不带正确口令一律 404。
+- 连接器里填的网址形如 `https://你的域名/mcp/<口令>`。**这个网址等同于密码**，不要发到聊天里或提交到仓库。
+- 中转站的真 key 也放在服务器的 `.env` 里（`RELAY_API_KEY=真key`），不用 `proxy` 占位。
+
 ## 密钥放哪
 
 **本仓库不含任何密钥，也不要往里提交密钥。** `.env` 已在 `.gitignore` 里。
@@ -54,7 +64,8 @@ Claude 的 x-search skill 用的就是这个入口。不带参数启动时才是
 
 ## 文件
 
-- `x_search_mcp.py`：MCP 服务器和命令行（0.5.0）
+- `x_search_mcp.py`：MCP 服务器、命令行和 HTTP 模式（0.6.0）
+- `deploy/`：服务器部署说明和 systemd 配置
 - `x_model_compare.py`：同一个问题对比不同 Grok 型号的搜索效果
 - `.mcp.json`：云端会话用的 MCP 注册
 

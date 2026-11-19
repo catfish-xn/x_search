@@ -31,7 +31,12 @@ Grok 只负责搜，返回帖子列表；读、筛、写报告交给调用它的
 命令行用法（不经过 MCP，直接搜，结果是 JSON，打印到标准输出）：
     python3 x_search_mcp.py search "要搜的内容" --hours 72 --coverage fast
     python3 x_search_mcp.py fetch https://x.com/账号/status/数字
-不带任何参数启动时，才是 MCP 服务器模式。
+    python3 x_search_mcp.py serve --port 8765      （HTTP 模式，见下）
+不带任何参数启动时，才是 stdio 的 MCP 服务器模式。
+
+HTTP 模式用于接成 Claude 的自定义连接器，需要再设一个环境变量：
+    X_HTTP_TOKEN     必填（仅 HTTP 模式）。访问口令，至少 24 个字符。
+                     服务入口是 POST /mcp/<口令>，不带正确口令的请求一律 404
 
 在 Claude Code 里注册（把路径和三个值换成你自己的）：
     claude mcp add x-search \
@@ -52,7 +57,7 @@ import urllib.error
 import urllib.request
 
 SERVER_NAME = "x-search"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.6.0"
 DEFAULT_PROTOCOL = "2025-06-18"
 UA = "Mozilla/5.0 (x-search-mcp)"
 KEY_VIA_PROXY = "proxy"
@@ -889,50 +894,155 @@ def send(msg):
     sys.stdout.flush()
 
 
-def reply(msg_id, result):
-    send({"jsonrpc": "2.0", "id": msg_id, "result": result})
+def ok(msg_id, result):
+    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
 
-def reply_error(msg_id, code, message):
-    send({"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}})
+def err(msg_id, code, message):
+    return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
 
 
-def handle(msg):
+def dispatch(msg):
+    """处理一条 JSON-RPC 消息。请求返回应答，通知返回 None。stdio 和 HTTP 两种模式共用。"""
     if not isinstance(msg, dict):
-        return
+        return None
     method = msg.get("method")
     msg_id = msg.get("id")
     is_request = "id" in msg and method is not None
     params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
 
+    if not is_request:
+        return None  # 通知（例如 notifications/initialized）不需要回复
     if method == "initialize":
         version = params.get("protocolVersion")
-        reply(msg_id, {
+        return ok(msg_id, {
             "protocolVersion": version if isinstance(version, str) else DEFAULT_PROTOCOL,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         })
-    elif method == "ping":
-        reply(msg_id, {})
-    elif method == "tools/list":
-        reply(msg_id, {"tools": TOOLS})
-    elif method == "tools/call":
+    if method == "ping":
+        return ok(msg_id, {})
+    if method == "tools/list":
+        return ok(msg_id, {"tools": TOOLS})
+    if method == "tools/call":
         name = params.get("name")
         args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
         impl = {"search_x": search_x_tool, "fetch_x_post": fetch_x_post_tool,
                 "get_x_result": get_x_result_tool}.get(name)
         if impl is None:
-            reply_error(msg_id, -32602, "未知的工具: %s" % name)
-            return
+            return err(msg_id, -32602, "未知的工具: %s" % name)
         try:
             is_error, text = impl(args)
         except Exception as e:  # 任何意外都转成工具错误，不让服务器崩掉
             log("%s 出现意外错误: %r" % (name, e))
             is_error, text = True, "工具内部出错：%s" % type(e).__name__
-        reply(msg_id, {"content": [{"type": "text", "text": text}], "isError": is_error})
-    elif is_request:
-        reply_error(msg_id, -32601, "不支持的方法: %s" % method)
-    # 其余是通知（例如 notifications/initialized），不需要回复
+        return ok(msg_id, {"content": [{"type": "text", "text": text}], "isError": is_error})
+    return err(msg_id, -32601, "不支持的方法: %s" % method)
+
+
+def handle(msg):
+    """stdio 模式：处理一条消息并把应答写到 stdout。"""
+    response = dispatch(msg)
+    if response is not None:
+        send(response)
+
+
+# ---------------------------------------------------------------- HTTP 模式（远程 MCP，Streamable HTTP）
+
+MAX_BODY = 1024 * 1024
+
+
+def serve_http(host, port):
+    """把同样的三个工具通过 HTTP 提供出去，用于接成 Claude 的自定义连接器。
+
+    唯一的入口是 POST /mcp/<口令>。口令来自环境变量 X_HTTP_TOKEN，
+    它就是这个服务的访问凭证：不知道口令的请求一律 404。
+    """
+    import hmac
+    import http.server
+
+    token = os.environ.get("X_HTTP_TOKEN", "").strip()
+    if len(token) < 24:
+        log("拒绝启动：X_HTTP_TOKEN 没有设置或太短（至少 24 个字符）。"
+            "可以用 python3 -c \"import secrets;print(secrets.token_urlsafe(32))\" 生成一个。")
+        return 2
+    expected = "/mcp/" + token
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "x-search"
+        sys_version = ""
+
+        def log_message(self, fmt, *args):  # 默认日志会把带口令的路径打出来，这里不记路径
+            pass
+
+        def authorized(self):
+            path = self.path.split("?", 1)[0].rstrip("/")
+            return hmac.compare_digest(path.encode("utf-8"), expected.encode("utf-8"))
+
+        def respond(self, status, body=b"", content_type="application/json"):
+            self.send_response(status)
+            if body:
+                self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def do_POST(self):
+            if not self.authorized():
+                return self.respond(404)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = -1
+            if length < 0 or length > MAX_BODY:
+                return self.respond(413)
+            raw = self.rfile.read(length)
+            try:
+                msg = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                body = json.dumps(err(None, -32700, "无法解析的消息"), ensure_ascii=False).encode("utf-8")
+                return self.respond(400, body)
+            if isinstance(msg, list):
+                responses = [r for r in (dispatch(m) for m in msg) if r is not None]
+                payload = responses or None
+            else:
+                payload = dispatch(msg)
+                method = msg.get("method") if isinstance(msg, dict) else None
+                if method == "tools/call":
+                    name = (msg.get("params") or {}).get("name") if isinstance(msg.get("params"), dict) else None
+                    log("HTTP 调用工具 %s" % name)
+            if payload is None:
+                return self.respond(202)  # 只有通知，没有需要返回的内容
+            self.respond(200, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+        def do_GET(self):
+            # 不提供服务端主动推送的流；也不提供 OAuth 发现信息（本服务不走 OAuth）
+            self.respond(405 if self.authorized() else 404)
+
+        do_DELETE = do_GET
+
+    class Server(http.server.ThreadingHTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+        def handle_error(self, request, client_address):
+            # 公网上会有各种乱七八糟的连接，断开或格式错误都很常见，只记一行，不打印堆栈
+            log("忽略一个异常连接（%s）" % type(sys.exc_info()[1]).__name__)
+
+    try:
+        httpd = Server((host, port), Handler)
+    except OSError as e:
+        log("启动失败：%s:%s 无法监听（%s）" % (host, port, type(e).__name__))
+        return 2
+    log("HTTP 模式已启动：%s:%d，入口是 POST /mcp/<口令>（口令不显示）" % (host, port))
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
 
 
 def cli(argv):
@@ -951,7 +1061,12 @@ def cli(argv):
     ps.add_argument("--include-replies", action="store_true")
     pf = sub.add_parser("fetch", help="取回一条帖子的全文")
     pf.add_argument("url")
+    ph = sub.add_parser("serve", help="以 HTTP 方式提供 MCP 服务（用于接成连接器）")
+    ph.add_argument("--host", default="127.0.0.1")
+    ph.add_argument("--port", type=int, default=8765)
     ns = parser.parse_args(argv)
+    if ns.cmd == "serve":
+        return serve_http(ns.host, ns.port)
     if ns.cmd == "search":
         is_error, text = search_x({
             "query": ns.query, "hours": ns.hours, "max_posts": ns.max_posts,
@@ -986,7 +1101,7 @@ def main():
         try:
             msg = json.loads(line)
         except ValueError:
-            reply_error(None, -32700, "无法解析的消息")
+            send(err(None, -32700, "无法解析的消息"))
             continue
         if isinstance(msg, list):
             for item in msg:

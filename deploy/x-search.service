@@ -1,0 +1,23 @@
+# systemd 服务：让 x-search 的 HTTP 模式开机自启、崩溃自动重启
+# 安装位置：/etc/systemd/system/x-search.service
+[Unit]
+Description=x-search MCP server (HTTP mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xsearch
+WorkingDirectory=/opt/x_search
+# 密钥和口令都从 /opt/x_search/.env 读取（脚本自己会读同目录的 .env）
+ExecStart=/usr/bin/python3 /opt/x_search/x_search_mcp.py serve --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=5
+# 收紧权限：这个服务只需要联网和读自己的目录
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
