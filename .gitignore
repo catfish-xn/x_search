@@ -1,0 +1,8 @@
+# 密钥和本地配置，绝不提交
+.env
+.env.*
+# 运行产物
+compare_*.json
+x_debug/
+__pycache__/
+*.pyc

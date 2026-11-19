@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "x-search": {
+      "command": "python3",
+      "args": ["x_search_mcp.py"],
+      "env": {
+        "RELAY_BASE_URL": "https://www.zzshu.cc/v1",
+        "RELAY_API_KEY": "proxy",
+        "RELAY_MODEL": "grok-4.5",
+        "RELAY_MODEL_ALT": "grok-4.7"
+      }
+    }
+  }
+}
