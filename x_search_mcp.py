@@ -28,6 +28,11 @@ Grok 只负责搜，返回帖子列表；读、筛、写报告交给调用它的
                      所以到时间没搜完会先返回一个 job_id，再用 get_x_result 取结果
     X_DEBUG_DIR      选填。填一个文件夹路径，每次调用的原始返回会存进去（不含 key）
 
+命令行用法（不经过 MCP，直接搜，结果是 JSON，打印到标准输出）：
+    python3 x_search_mcp.py search "要搜的内容" --hours 72 --coverage fast
+    python3 x_search_mcp.py fetch https://x.com/账号/status/数字
+不带任何参数启动时，才是 MCP 服务器模式。
+
 在 Claude Code 里注册（把路径和三个值换成你自己的）：
     claude mcp add x-search \
       --env RELAY_BASE_URL=https://中转站地址/v1 \
@@ -47,7 +52,7 @@ import urllib.error
 import urllib.request
 
 SERVER_NAME = "x-search"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 DEFAULT_PROTOCOL = "2025-06-18"
 UA = "Mozilla/5.0 (x-search-mcp)"
 KEY_VIA_PROXY = "proxy"
@@ -66,7 +71,7 @@ TOOL = {
         "每条帖子都带有根据帖子 ID 反推出的真实发帖时间（id_time_utc），可用来核对。"
         "结果里的 search_ran 为 false 时说明搜索没有真正执行，内容不可信，不要引用。"
         "帖子带 is_article 为 true 时，正文是一篇长文章，只有链接；需要内容时用 fetch_x_post 取全文。"
-        "搜索本身需要 2 到 4 分钟，所以本工具通常不会直接给出结果："
+        "搜索本身需要 2 到 6 分钟（时间范围越大越久），所以本工具通常不会直接给出结果："
         "返回里 status 为 running 时，记下 job_id，等 60 秒左右再调用 get_x_result 取结果，没好就继续取。"
         "不要因为 status 是 running 就重新调用 search_x，那样会重复搜索。"
         "关键词搜不准时，换几组不同的词分别调用。"
@@ -698,6 +703,9 @@ def save_debug(raw, label, now):
 def upstream_error(status, raw, model):
     if status == 524:
         hint = "中转站等上游超时（Cloudflare 约 100 秒上限）。请确认 X_STREAM 没有被关掉，或减少 max_posts。"
+    elif status in (401, 403):
+        hint = ("中转站不认这次请求的 key。RELAY_API_KEY 填的是 proxy 时，说明当前环境没有替它补 key："
+                "需要在这个会话所用的云端环境里，为中转站域名添加 Network secret。")
     elif status in RETRY_STATUS:
         hint = "中转站可能在限流或暂时不稳定，稍后再试。"
     else:
@@ -927,6 +935,40 @@ def handle(msg):
     # 其余是通知（例如 notifications/initialized），不需要回复
 
 
+def cli(argv):
+    """命令行模式：直接搜一次并打印 JSON。成功返回 0，失败返回 1。"""
+    import argparse
+    parser = argparse.ArgumentParser(prog="x_search_mcp.py", description="X 搜索（命令行模式）")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    ps = sub.add_parser("search", help="搜帖子")
+    ps.add_argument("query")
+    ps.add_argument("--hours", type=int, default=24)
+    ps.add_argument("--max-posts", type=int, default=20)
+    ps.add_argument("--language", choices=["zh", "en", "any"], default="any")
+    ps.add_argument("--coverage", choices=["wide", "fast"], default="wide")
+    ps.add_argument("--handles", default="", help="只搜这些账号，逗号分隔")
+    ps.add_argument("--exclude-handles", default="", help="排除这些账号，逗号分隔")
+    ps.add_argument("--include-replies", action="store_true")
+    pf = sub.add_parser("fetch", help="取回一条帖子的全文")
+    pf.add_argument("url")
+    ns = parser.parse_args(argv)
+    if ns.cmd == "search":
+        is_error, text = search_x({
+            "query": ns.query, "hours": ns.hours, "max_posts": ns.max_posts,
+            "language": ns.language, "coverage": ns.coverage,
+            "handles": [h for h in ns.handles.split(",") if h.strip()],
+            "exclude_handles": [h for h in ns.exclude_handles.split(",") if h.strip()],
+            "include_replies": ns.include_replies,
+        })
+    else:
+        is_error, text = fetch_x_post({"url": ns.url})
+    if is_error:
+        text = json.dumps({"error": text}, ensure_ascii=False, indent=1)
+    sys.stdout.write(text + "\n")
+    sys.stdout.flush()
+    return 1 if is_error else 0
+
+
 def main():
     for stream in (sys.stdin, sys.stdout, sys.stderr):
         try:
@@ -934,6 +976,8 @@ def main():
         except (AttributeError, ValueError):
             pass
     load_dotenv()
+    if len(sys.argv) > 1:
+        sys.exit(cli(sys.argv[1:]))
     log("已启动，模型 %s" % (os.environ.get("RELAY_MODEL", "").strip() or "grok-4.5"))
     for line in sys.stdin:
         line = line.strip()

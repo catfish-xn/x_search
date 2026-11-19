@@ -15,6 +15,16 @@ X 搜索 MCP 服务器（stdio，零依赖，只用 Python 自带库）。Grok �
 最多等 45 秒（`X_WAIT_SECONDS` 可改）：没搜完就先返回 `status: running` 和一个 `job_id`，
 搜索在后台继续，之后用 `get_x_result` 传入 `job_id` 取结果。
 
+## 命令行模式
+
+不经过 MCP，直接搜一次，结果是 JSON：
+
+    python3 x_search_mcp.py search "要搜的内容" --hours 72 --coverage fast
+    python3 x_search_mcp.py fetch https://x.com/账号/status/数字
+
+命令行没有 60 秒的限制，一条命令等到搜完为止（实测 72 小时范围约 6 分钟）。
+Claude 的 x-search skill 用的就是这个入口。不带参数启动时才是 MCP 服务器。
+
 ## 密钥放哪
 
 **本仓库不含任何密钥，也不要往里提交密钥。** `.env` 已在 `.gitignore` 里。
@@ -44,7 +54,7 @@ X 搜索 MCP 服务器（stdio，零依赖，只用 Python 自带库）。Grok �
 
 ## 文件
 
-- `x_search_mcp.py`：MCP 服务器（0.4.0）
+- `x_search_mcp.py`：MCP 服务器和命令行（0.5.0）
 - `x_model_compare.py`：同一个问题对比不同 Grok 型号的搜索效果
 - `.mcp.json`：云端会话用的 MCP 注册
 
