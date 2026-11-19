@@ -23,6 +23,9 @@ Grok 只负责搜，返回帖子列表；读、筛、写报告交给调用它的
                      填 0 则关闭
     X_TIMEOUT        选填。两次收到数据之间最长等待秒数，默认 180
     X_RETRY_DELAYS   选填。失败后的重试等待秒数，默认 5,15,30
+    X_WAIT_SECONDS   选填。一次工具调用最多等多少秒就先返回，默认 45。
+                     很多客户端的工具调用上限是 60 秒，而一次搜索要 2 到 4 分钟，
+                     所以到时间没搜完会先返回一个 job_id，再用 get_x_result 取结果
     X_DEBUG_DIR      选填。填一个文件夹路径，每次调用的原始返回会存进去（不含 key）
 
 在 Claude Code 里注册（把路径和三个值换成你自己的）：
@@ -44,7 +47,7 @@ import urllib.error
 import urllib.request
 
 SERVER_NAME = "x-search"
-SERVER_VERSION = "0.3.1"
+SERVER_VERSION = "0.4.0"
 DEFAULT_PROTOCOL = "2025-06-18"
 UA = "Mozilla/5.0 (x-search-mcp)"
 KEY_VIA_PROXY = "proxy"
@@ -63,7 +66,10 @@ TOOL = {
         "每条帖子都带有根据帖子 ID 反推出的真实发帖时间（id_time_utc），可用来核对。"
         "结果里的 search_ran 为 false 时说明搜索没有真正执行，内容不可信，不要引用。"
         "帖子带 is_article 为 true 时，正文是一篇长文章，只有链接；需要内容时用 fetch_x_post 取全文。"
-        "一次调用大约需要 2 到 4 分钟。关键词搜不准时，换几组不同的词分别调用。"
+        "搜索本身需要 2 到 4 分钟，所以本工具通常不会直接给出结果："
+        "返回里 status 为 running 时，记下 job_id，等 60 秒左右再调用 get_x_result 取结果，没好就继续取。"
+        "不要因为 status 是 running 就重新调用 search_x，那样会重复搜索。"
+        "关键词搜不准时，换几组不同的词分别调用。"
     ),
     "inputSchema": {
         "type": "object",
@@ -124,7 +130,8 @@ FETCH_TOOL = {
     "description": (
         "取回一条 X 帖子的完整内容，包括它所在的串和它链接的长文章（article）正文。"
         "用于 search_x 结果里 is_article 为 true 的帖子，或需要逐字核对某条帖子原文时。"
-        "got_article 为 false 表示没取到文章正文。一次调用大约需要 1 分钟。"
+        "got_article 为 false 表示没取到文章正文。抓取需要 1 到 3 分钟："
+        "返回里 status 为 running 时，记下 job_id，稍后用 get_x_result 取结果。"
     ),
     "inputSchema": {
         "type": "object",
@@ -135,7 +142,23 @@ FETCH_TOOL = {
     },
 }
 
-TOOLS = [TOOL, FETCH_TOOL]
+RESULT_TOOL = {
+    "name": "get_x_result",
+    "description": (
+        "取回 search_x 或 fetch_x_post 的结果。传入它们返回的 job_id。"
+        "任务还没完成时会等一小段时间；仍未完成则返回 status 为 running，过 30 到 60 秒再调用一次。"
+        "status 为 not_found 说明服务器重启过、任务已丢失，需要重新发起搜索。"
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string", "description": "search_x 或 fetch_x_post 返回的 job_id"},
+        },
+        "required": ["job_id"],
+    },
+}
+
+TOOLS = [TOOL, FETCH_TOOL, RESULT_TOOL]
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -778,6 +801,79 @@ def fetch_x_post(args):
     return False, json.dumps(result, ensure_ascii=False, indent=1)
 
 
+# ---------------------------------------------------------------- 后台任务
+
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+JOB_SEQ = [0]
+MAX_JOBS = 30
+
+
+def wait_seconds():
+    return max(0, min(55, env_int("X_WAIT_SECONDS", 45)))
+
+
+def start_job(kind, impl, args):
+    """在后台线程里跑一个耗时工具，返回 job_id。"""
+    with JOBS_LOCK:
+        JOB_SEQ[0] += 1
+        job_id = "%s-%d-%d" % (kind, int(time.time()) % 100000, JOB_SEQ[0])
+        job = {"kind": kind, "started": time.time(), "done": threading.Event(), "is_error": False, "text": ""}
+        JOBS[job_id] = job
+        # 只保留最近的若干个，先清理已完成的旧任务
+        if len(JOBS) > MAX_JOBS:
+            for old_id in sorted(JOBS, key=lambda k: JOBS[k]["started"]):
+                if len(JOBS) <= MAX_JOBS:
+                    break
+                if JOBS[old_id]["done"].is_set():
+                    del JOBS[old_id]
+
+    def run():
+        try:
+            job["is_error"], job["text"] = impl(args)
+        except Exception as e:  # 任何意外都转成工具错误
+            log("%s 出现意外错误: %r" % (kind, e))
+            job["is_error"], job["text"] = True, "工具内部出错：%s" % type(e).__name__
+        job["finished"] = time.time()
+        job["done"].set()
+
+    threading.Thread(target=run, daemon=True).start()
+    return job_id
+
+
+def job_reply(job_id, wait):
+    """等待最多 wait 秒。完成则返回真实结果，否则返回进行中的状态。"""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        return True, json.dumps({"status": "not_found", "job_id": job_id,
+                                 "hint": "找不到这个任务，可能是服务器重启过。请重新调用 search_x 或 fetch_x_post。"},
+                                ensure_ascii=False, indent=1)
+    if job["done"].wait(wait):
+        return job["is_error"], job["text"]
+    return False, json.dumps({
+        "status": "running",
+        "job_id": job_id,
+        "elapsed_seconds": round(time.time() - job["started"], 1),
+        "hint": "还在搜。等 30 到 60 秒后调用 get_x_result 并传入这个 job_id；不要重新发起同样的搜索。",
+    }, ensure_ascii=False, indent=1)
+
+
+def search_x_tool(args):
+    return job_reply(start_job("search", search_x, args), wait_seconds())
+
+
+def fetch_x_post_tool(args):
+    return job_reply(start_job("fetch", fetch_x_post, args), wait_seconds())
+
+
+def get_x_result_tool(args):
+    job_id = args.get("job_id")
+    if not isinstance(job_id, str) or not job_id.strip():
+        return True, "参数 job_id 不能为空。"
+    return job_reply(job_id.strip(), wait_seconds())
+
+
 # ---------------------------------------------------------------- MCP 协议（stdio）
 
 def send(msg):
@@ -815,7 +911,8 @@ def handle(msg):
     elif method == "tools/call":
         name = params.get("name")
         args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-        impl = {"search_x": search_x, "fetch_x_post": fetch_x_post}.get(name)
+        impl = {"search_x": search_x_tool, "fetch_x_post": fetch_x_post_tool,
+                "get_x_result": get_x_result_tool}.get(name)
         if impl is None:
             reply_error(msg_id, -32602, "未知的工具: %s" % name)
             return

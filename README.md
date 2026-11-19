@@ -7,6 +7,13 @@ X 搜索 MCP 服务器（stdio，零依赖，只用 Python 自带库）。Grok �
 - `search_x`：搜帖子。默认 `coverage=wide`，grok-4.5（中文社区）和 grok-4.7（英文高互动）同时搜再合并去重；`coverage=fast` 只用主型号。
   每条帖子带 `id_time_utc`（由帖子 ID 反推的真实发帖时间）和 `found_by`（哪个型号找到的）。
 - `fetch_x_post`：取回一条帖子的完整内容，包括长文章正文。用于 `is_article` 为 true 的帖子。
+- `get_x_result`：取回上面两个工具的结果。
+
+### 为什么要分两步
+
+一次搜索要 2 到 4 分钟，而 Claude 云端会话里一次工具调用最多等 60 秒。所以 `search_x` 和 `fetch_x_post`
+最多等 45 秒（`X_WAIT_SECONDS` 可改）：没搜完就先返回 `status: running` 和一个 `job_id`，
+搜索在后台继续，之后用 `get_x_result` 传入 `job_id` 取结果。
 
 ## 密钥放哪
 
@@ -37,7 +44,7 @@ X 搜索 MCP 服务器（stdio，零依赖，只用 Python 自带库）。Grok �
 
 ## 文件
 
-- `x_search_mcp.py`：MCP 服务器（0.3.1）
+- `x_search_mcp.py`：MCP 服务器（0.4.0）
 - `x_model_compare.py`：同一个问题对比不同 Grok 型号的搜索效果
 - `.mcp.json`：云端会话用的 MCP 注册
 
